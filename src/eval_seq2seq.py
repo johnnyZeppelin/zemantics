@@ -51,7 +51,8 @@ def nll_from_encoder_outputs(model, h: torch.Tensor, attn_mask: torch.Tensor, la
     enc_out = BaseModelOutput(last_hidden_state=h)
     out = model(
         encoder_outputs=enc_out,
-        encoder_attention_mask=attn_mask,
+        # encoder_attention_mask=attn_mask,
+        attention_mask=attn_mask,
         labels=labels,
         use_cache=False,
         return_dict=True,
