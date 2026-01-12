@@ -14,7 +14,7 @@ print(ex_zh["article"].keys())
 # something else 57945 in total 6541 for Chinese in total
 # for kk, itt in ds_en["train"][57944].items():
 #     print(f'{kk}: {itt}')
-# print(f'It is {ds_zh["train"][6540]['article'].keys()}')
-print(f'It is {ds_zh["train"][6540]['article']['section_name']}')
-print(f'HERE WE GO: {ds_zh["train"][6540]['article']['english_section_name']}')
-print(f'HERE WE SUMMARIZE: {ds_zh["train"][6540]['article']['summary']}')
+# print(f'It is {ds_zh["train"][6539]['article'].keys()}')
+print(f'It is {ds_zh["train"][6539]['article']['section_name']}')
+print(f'HERE WE GO: {ds_zh["train"][6539]['article']['english_section_name']}')
+print(f'HERE WE SUMMARIZE: {ds_zh["train"][6539]['article']['summary']}')
