@@ -301,7 +301,10 @@ def main() -> None:
 
             # noise with warmup
             r = noise_ramp(step, noise_start, args.noise_warmup_steps)
-            noise_std = args.latent_noise_std * r
+            # noise_std = args.latent_noise_std * r
+            # changed
+            noise_std = (args.latent_noise_std * torch.rand((), device=z_en.device).item()) * r
+            
             if noise_std > 0:
                 z_en = z_en + torch.randn_like(z_en) * noise_std
                 z_zh = z_zh + torch.randn_like(z_zh) * noise_std
