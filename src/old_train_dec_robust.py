@@ -5,7 +5,7 @@ import json
 import os
 import time
 import random
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,9 +38,12 @@ def unfreeze_decoder_only(lrm: LatentRendererModel, train_lm_head: bool = True) 
     """
     freeze_all(lrm)
 
+    # HF seq2seq model: encoder/decoder live inside lrm.model
+    # For T5-like: lrm.model.get_decoder() exists
     dec = lrm.model.get_decoder()
     set_requires_grad(dec, True)
 
+    # lm_head is used for vocab projection
     if train_lm_head and hasattr(lrm.model, "lm_head") and isinstance(lrm.model.lm_head, nn.Module):
         set_requires_grad(lrm.model.lm_head, True)
 
@@ -66,6 +69,7 @@ def maybe_untie_lm_head(lrm: LatentRendererModel) -> None:
 
     new_head = nn.Linear(d_model, vocab, bias=False).to(next(lrm.parameters()).device)
     with torch.no_grad():
+        # copy from existing lm_head (tied or not)
         new_head.weight.copy_(lm_head.weight.detach())
 
     lrm.model.lm_head = new_head
@@ -81,6 +85,7 @@ def encode_to_z_deterministic(
     Deterministic encoder+bottleneck forward (no dropout, no noise).
     Returns z: [B, K, D]
     """
+    # Put encoder+bottleneck in eval to disable dropout
     enc = lrm.model.get_encoder()
     enc_was_training = enc.training
     bn_was_training = lrm.bottleneck.training
@@ -92,6 +97,7 @@ def encode_to_z_deterministic(
     h = enc_out.last_hidden_state
     z = lrm.bottleneck(h, h_attn_mask=attention_mask)
 
+    # restore states
     if enc_was_training:
         enc.train()
     if bn_was_training:
@@ -107,37 +113,6 @@ def noise_ramp(step: int, start_step: int, warmup_steps: int) -> float:
         return 0.0
     k = min(step - start_step, warmup_steps)
     return float(k) / float(warmup_steps)
-
-
-def sample_noise_multiplier(noise_floor: float, noise_power: float) -> float:
-    """
-    Sample m in [noise_floor, 1], with optional bias toward larger values.
-
-    u ~ Uniform(0, 1)
-    m = noise_floor + (1 - noise_floor) * (u ** noise_power)
-
-    - noise_floor=0, noise_power=1 -> Uniform(0,1)  (your current behavior)
-    - noise_floor=0.3, noise_power=1 -> Uniform(0.3, 1)
-    - noise_floor=0.3, noise_power=0.5 -> more mass near 1 (stronger noise more often)
-    - noise_floor=0.3, noise_power=2 -> more mass near 0.3 (weaker noise more often)
-    """
-    nf = float(noise_floor)
-    npow = float(noise_power)
-
-    if nf < 0.0:
-        nf = 0.0
-    if nf > 1.0:
-        nf = 1.0
-    if npow <= 0.0:
-        npow = 1.0
-
-    u = random.random()
-    m = nf + (1.0 - nf) * (u ** npow)
-    if m < nf:
-        m = nf
-    if m > 1.0:
-        m = 1.0
-    return float(m)
 
 
 @torch.no_grad()
@@ -206,6 +181,7 @@ def try_load_checkpoint_model_only(
     if "model_state" in ckpt:
         lrm.load_state_dict(ckpt["model_state"], strict=True)
     else:
+        # allow resuming from a pure model state dict
         lrm.load_state_dict(ckpt, strict=True)
 
     step = int(ckpt.get("step", 0)) if isinstance(ckpt, dict) else 0
@@ -245,10 +221,6 @@ def main() -> None:
     ap.add_argument("--noise_warmup_steps", type=int, default=500)
     ap.add_argument("--noise_warmup_start_step", type=int, default=-1, help="-1 means use resumed step as start")
 
-    # NEW: noise multiplier distribution control
-    ap.add_argument("--noise_floor", type=float, default=0.0, help="noise multiplier floor in [0,1]. 0 keeps old behavior.")
-    ap.add_argument("--noise_power", type=float, default=1.0, help="u**noise_power. <1 biases larger noise; >1 biases smaller noise.")
-
     ap.add_argument("--untie_lm_head", action="store_true", help="train a fresh lm_head without touching shared embeddings")
     ap.add_argument("--seed", type=int, default=42)
 
@@ -262,18 +234,10 @@ def main() -> None:
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
 
     tok = AutoTokenizer.from_pretrained(args.backbone)
-    train_ds = WikiLinguaGroupDataset(
-        args.train_jsonl,
-        max_examples=(None if args.max_train_examples <= 0 else args.max_train_examples),
-    )
-    valid_ds = WikiLinguaGroupDataset(
-        args.valid_jsonl,
-        max_examples=(None if args.max_valid_examples <= 0 else args.max_valid_examples),
-    )
+    train_ds = WikiLinguaGroupDataset(args.train_jsonl, max_examples=(None if args.max_train_examples <= 0 else args.max_train_examples))
+    valid_ds = WikiLinguaGroupDataset(args.valid_jsonl, max_examples=(None if args.max_valid_examples <= 0 else args.max_valid_examples))
     collate = make_collate_fn(tok, max_doc_len=args.max_doc_len, max_sum_len=args.max_sum_len)
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
@@ -291,6 +255,7 @@ def main() -> None:
     if args.untie_lm_head:
         maybe_untie_lm_head(lrm)
 
+    # decoder-only trainable params
     unfreeze_decoder_only(lrm, train_lm_head=True)
 
     trainable_params = [p for p in lrm.parameters() if p.requires_grad]
@@ -312,7 +277,7 @@ def main() -> None:
         noise_start = args.noise_warmup_start_step
 
     for epoch in range(args.epochs):
-        lrm.train()
+        lrm.train()  # decoder train mode
 
         for batch in train_dl:
             step += 1
@@ -328,15 +293,18 @@ def main() -> None:
                 z_en = encode_to_z_deterministic(lrm, en_ids, en_m)
                 z_zh = encode_to_z_deterministic(lrm, zh_ids, zh_m)
 
-            # 2) Apply robustness augmentation on z
+            # 2) Apply robustness augmentation on z (dropout + noise), still no grad needed for z
+            # dropout (force training=True to always apply)
             if args.latent_dropout > 0:
                 z_en = F.dropout(z_en, p=args.latent_dropout, training=True)
                 z_zh = F.dropout(z_zh, p=args.latent_dropout, training=True)
 
-            ramp = noise_ramp(step, noise_start, args.noise_warmup_steps)
-            mult = sample_noise_multiplier(args.noise_floor, args.noise_power)
-            noise_std = float(args.latent_noise_std) * float(ramp) * float(mult)
-
+            # noise with warmup
+            r = noise_ramp(step, noise_start, args.noise_warmup_steps)
+            # noise_std = args.latent_noise_std * r
+            # changed
+            noise_std = (args.latent_noise_std * torch.rand((), device=z_en.device).item()) * r
+            
             if noise_std > 0:
                 z_en = z_en + torch.randn_like(z_en) * noise_std
                 z_zh = z_zh + torch.randn_like(z_zh) * noise_std
@@ -363,8 +331,6 @@ def main() -> None:
                     "loss": float(loss.item()),
                     "loss_en": float(loss_en.item()),
                     "loss_zh": float(loss_zh.item()),
-                    "noise_ramp": float(ramp),
-                    "noise_mult": float(mult),
                     "noise_std_eff": float(noise_std),
                     "elapsed_sec": float(time.time() - t0),
                 }
