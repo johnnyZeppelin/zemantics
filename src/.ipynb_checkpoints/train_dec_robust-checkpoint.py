@@ -34,7 +34,7 @@ def freeze_all(model: nn.Module) -> None:
 def unfreeze_decoder_only(lrm: LatentRendererModel, train_lm_head: bool = True) -> None:
     """
     Freeze everything, then unfreeze decoder (and optionally lm_head).
-    We keep encoder, bottleneck frozen to avoid changing z (and leakage).
+    Keep encoder, bottleneck frozen to avoid changing z (and leakage).
     """
     freeze_all(lrm)
 
@@ -52,8 +52,7 @@ def unfreeze_decoder_only(lrm: LatentRendererModel, train_lm_head: bool = True) 
 def maybe_untie_lm_head(lrm: LatentRendererModel) -> None:
     """
     Create a fresh lm_head (copy init weights) so we can train output projection
-    without touching encoder-decoder shared embeddings.
-    This is useful because T5 ties lm_head weights to shared embeddings.
+    without touching shared embeddings. (T5 ties lm_head to shared embeddings)
     """
     if not hasattr(lrm.model, "lm_head"):
         return
@@ -109,35 +108,19 @@ def noise_ramp(step: int, start_step: int, warmup_steps: int) -> float:
     return float(k) / float(warmup_steps)
 
 
-def sample_noise_multiplier(noise_floor: float, noise_power: float) -> float:
+def sample_noise_mult(device: torch.device, floor: float, power: float) -> float:
     """
-    Sample m in [noise_floor, 1], with optional bias toward larger values.
-
-    u ~ Uniform(0, 1)
-    m = noise_floor + (1 - noise_floor) * (u ** noise_power)
-
-    - noise_floor=0, noise_power=1 -> Uniform(0,1)  (your current behavior)
-    - noise_floor=0.3, noise_power=1 -> Uniform(0.3, 1)
-    - noise_floor=0.3, noise_power=0.5 -> more mass near 1 (stronger noise more often)
-    - noise_floor=0.3, noise_power=2 -> more mass near 0.3 (weaker noise more often)
+    Sample noise multiplier in [floor, 1] with optional power shaping:
+      u ~ Uniform(0,1)
+      mult = floor + (1-floor) * (u ** power)
+    power < 1 biases toward 1, power > 1 biases toward floor.
     """
-    nf = float(noise_floor)
-    npow = float(noise_power)
-
-    if nf < 0.0:
-        nf = 0.0
-    if nf > 1.0:
-        nf = 1.0
-    if npow <= 0.0:
-        npow = 1.0
-
-    u = random.random()
-    m = nf + (1.0 - nf) * (u ** npow)
-    if m < nf:
-        m = nf
-    if m > 1.0:
-        m = 1.0
-    return float(m)
+    floor = float(max(0.0, min(1.0, floor)))
+    power = float(max(1e-8, power))
+    u = torch.rand((), device=device)
+    u = u.pow(power)
+    mult = floor + (1.0 - floor) * u
+    return float(mult.item())
 
 
 @torch.no_grad()
@@ -232,6 +215,7 @@ def main() -> None:
     ap.add_argument("--max_sum_len", type=int, default=64)
 
     ap.add_argument("--eval_every", type=int, default=400)
+    ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--max_train_examples", type=int, default=0, help="0 means all")
     ap.add_argument("--max_valid_examples", type=int, default=0, help="0 means all")
 
@@ -240,16 +224,26 @@ def main() -> None:
 
     # Robustness knobs applied on Z before decoder
     ap.add_argument("--latent_dropout", type=float, default=0.1)
-    ap.add_argument("--latent_noise_std", type=float, default=0.01)
 
+    # noise base std, then scaled by noise_ramp * noise_mult
+    ap.add_argument("--latent_noise_std", type=float, default=0.01)
     ap.add_argument("--noise_warmup_steps", type=int, default=500)
     ap.add_argument("--noise_warmup_start_step", type=int, default=-1, help="-1 means use resumed step as start")
 
-    # NEW: noise multiplier distribution control
-    ap.add_argument("--noise_floor", type=float, default=0.0, help="noise multiplier floor in [0,1]. 0 keeps old behavior.")
-    ap.add_argument("--noise_power", type=float, default=1.0, help="u**noise_power. <1 biases larger noise; >1 biases smaller noise.")
+    # noise multiplier sampling: mult in [floor, 1] with power shaping
+    ap.add_argument("--noise_mult_floor", type=float, default=0.0)
+    ap.add_argument("--noise_mult_pow", type=float, default=1.0)
 
-    ap.add_argument("--untie_lm_head", action="store_true", help="train a fresh lm_head without touching shared embeddings")
+    # ---- R2k: "pin" zero-ablation ----
+    # (1) z-zero mixing: with prob p, set z for that sample to all zeros (cheap)
+    ap.add_argument("--z_zero_prob", type=float, default=0.0)
+
+    # (2) z-zero auxiliary loss: loss += w * CE(decode(z=0), labels) (stronger, more compute)
+    ap.add_argument("--z_zero_loss_weight", type=float, default=0.0)
+    ap.add_argument("--z_zero_loss_every", type=int, default=1, help="compute aux loss every k steps (>=1)")
+
+    ap.add_argument("--untie_lm_head", action="store_true",
+                    help="train a fresh lm_head without touching shared embeddings")
     ap.add_argument("--seed", type=int, default=42)
 
     args = ap.parse_args()
@@ -262,10 +256,9 @@ def main() -> None:
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
 
     tok = AutoTokenizer.from_pretrained(args.backbone)
+
     train_ds = WikiLinguaGroupDataset(
         args.train_jsonl,
         max_examples=(None if args.max_train_examples <= 0 else args.max_train_examples),
@@ -274,8 +267,8 @@ def main() -> None:
         args.valid_jsonl,
         max_examples=(None if args.max_valid_examples <= 0 else args.max_valid_examples),
     )
-    collate = make_collate_fn(tok, max_doc_len=args.max_doc_len, max_sum_len=args.max_sum_len)
 
+    collate = make_collate_fn(tok, max_doc_len=args.max_doc_len, max_sum_len=args.max_sum_len)
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     valid_dl = DataLoader(valid_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
 
@@ -291,6 +284,7 @@ def main() -> None:
     if args.untie_lm_head:
         maybe_untie_lm_head(lrm)
 
+    # decoder-only trainable params
     unfreeze_decoder_only(lrm, train_lm_head=True)
 
     trainable_params = [p for p in lrm.parameters() if p.requires_grad]
@@ -306,13 +300,10 @@ def main() -> None:
     t0 = time.time()
     opt.zero_grad(set_to_none=True)
 
-    if args.noise_warmup_start_step < 0:
-        noise_start = step
-    else:
-        noise_start = args.noise_warmup_start_step
+    noise_start = step if args.noise_warmup_start_step < 0 else args.noise_warmup_start_step
 
     for epoch in range(args.epochs):
-        lrm.train()
+        lrm.train()  # decoder train mode
 
         for batch in train_dl:
             step += 1
@@ -323,31 +314,59 @@ def main() -> None:
             zh_m = batch["zh_attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
+            bs = en_ids.size(0)
+
             # 1) Encode z deterministically under no_grad
             with torch.no_grad():
                 z_en = encode_to_z_deterministic(lrm, en_ids, en_m)
                 z_zh = encode_to_z_deterministic(lrm, zh_ids, zh_m)
 
-            # 2) Apply robustness augmentation on z
+            # 2) Apply robustness augmentation on z: dropout + noise
             if args.latent_dropout > 0:
                 z_en = F.dropout(z_en, p=args.latent_dropout, training=True)
                 z_zh = F.dropout(z_zh, p=args.latent_dropout, training=True)
 
-            ramp = noise_ramp(step, noise_start, args.noise_warmup_steps)
-            mult = sample_noise_multiplier(args.noise_floor, args.noise_power)
-            noise_std = float(args.latent_noise_std) * float(ramp) * float(mult)
+            r = noise_ramp(step, noise_start, args.noise_warmup_steps)
+            noise_mult = 1.0
+            noise_std_eff = 0.0
 
-            if noise_std > 0:
-                z_en = z_en + torch.randn_like(z_en) * noise_std
-                z_zh = z_zh + torch.randn_like(z_zh) * noise_std
+            if args.latent_noise_std > 0 and r > 0:
+                noise_mult = sample_noise_mult(z_en.device, args.noise_mult_floor, args.noise_mult_pow)
+                noise_std_eff = float(args.latent_noise_std) * float(noise_mult) * float(r)
+                if noise_std_eff > 0:
+                    z_en = z_en + torch.randn_like(z_en) * noise_std_eff
+                    z_zh = z_zh + torch.randn_like(z_zh) * noise_std_eff
 
-            # 3) Decode and compute render loss
+            # 3) R2k-A: z-zero mixing (cheap)
+            z_zero_frac = 0.0
+            if args.z_zero_prob > 0:
+                p = float(max(0.0, min(1.0, args.z_zero_prob)))
+                mask = (torch.rand((bs, 1, 1), device=z_en.device) < p).float()
+                z_zero_frac = float(mask.mean().item())
+                z_en = z_en * (1.0 - mask)
+                z_zh = z_zh * (1.0 - mask)
+
+            # 4) Main decode loss
             logits_en = lrm.decode_from_z(z_en, labels=labels)
             logits_zh = lrm.decode_from_z(z_zh, labels=labels)
 
             loss_en = ce_loss_from_logits(logits_en, labels)
             loss_zh = ce_loss_from_logits(logits_zh, labels)
-            loss = 0.5 * (loss_en + loss_zh)
+            loss_main = 0.5 * (loss_en + loss_zh)
+
+            # 5) R2k-B: z-zero auxiliary loss (stronger)
+            loss_zero = torch.tensor(0.0, device=device)
+            do_zero_aux = (args.z_zero_loss_weight > 0) and (args.z_zero_loss_every >= 1) and (step % args.z_zero_loss_every == 0)
+            if do_zero_aux:
+                z0_en = torch.zeros_like(z_en)
+                z0_zh = torch.zeros_like(z_zh)
+                logits0_en = lrm.decode_from_z(z0_en, labels=labels)
+                logits0_zh = lrm.decode_from_z(z0_zh, labels=labels)
+                l0_en = ce_loss_from_logits(logits0_en, labels)
+                l0_zh = ce_loss_from_logits(logits0_zh, labels)
+                loss_zero = 0.5 * (l0_en + l0_zh)
+
+            loss = loss_main + float(args.z_zero_loss_weight) * loss_zero
 
             (loss / args.grad_accum).backward()
 
@@ -356,16 +375,22 @@ def main() -> None:
                 opt.step()
                 opt.zero_grad(set_to_none=True)
 
-            if step % 20 == 0:
+            if step % args.log_every == 0:
                 msg = {
                     "step": step,
                     "epoch": epoch,
                     "loss": float(loss.item()),
+                    "loss_main": float(loss_main.item()),
+                    "loss_zero": float(loss_zero.item()) if do_zero_aux else 0.0,
                     "loss_en": float(loss_en.item()),
                     "loss_zh": float(loss_zh.item()),
-                    "noise_ramp": float(ramp),
-                    "noise_mult": float(mult),
-                    "noise_std_eff": float(noise_std),
+                    "noise_ramp": float(r),
+                    "noise_mult": float(noise_mult),
+                    "noise_std_eff": float(noise_std_eff),
+                    "z_zero_prob": float(args.z_zero_prob),
+                    "z_zero_frac": float(z_zero_frac),
+                    "z_zero_loss_weight": float(args.z_zero_loss_weight),
+                    "z_zero_loss_every": int(args.z_zero_loss_every),
                     "elapsed_sec": float(time.time() - t0),
                 }
                 print(msg)
